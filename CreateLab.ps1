@@ -12,7 +12,11 @@
     [string]
     $Location="West Europe",
     [string]
-    $RoleDefinitionName="Contributor"
+    $RoleDefinitionName="Contributor",
+    [bool]
+    $CreateCloudShellStorage=$true,
+    [string]
+    $CloudShellStorageSku="Standard_LRS"
 )
 
 # Check Admin Rights
@@ -32,8 +36,7 @@ if($adModule -eq $null)
 }
 
 $currentAzureContext = Get-AzureRmContext
-$currentAzureContext
-if($currentAzureContext -eq $null)
+if($currentAzureContext.Name -eq "Default")
 {
     # Login Azure Account
     Login-AzureRmAccount
@@ -53,6 +56,39 @@ $domainName = $ad.TenantDomain
 # Create Password Profile
 $PasswordProfile = New-Object -TypeName Microsoft.Open.AzureAD.Model.PasswordProfile
 $PasswordProfile.Password = $StartPassword
+
+$locationForRgName = $Location.ToLower().Replace(" ", "")
+$csRgName = "cloud-shell-storage-$($locationForRgName)"
+$storageAcc = $null;
+if($CreateCloudShellStorage)
+{
+    # Create Resource Group for Shell Storage
+    $rg = Get-AzureRmResourceGroup -Name $csRgName -ErrorAction SilentlyContinue
+    if($rg -eq $null)
+    {
+        Write-Host "Create Resource Group $($csRgName)"
+        New-AzureRmResourceGroup -Location $Location -Name $displayName
+    }
+    else
+    {
+       Write-Host "Resource Group $($csRgName) already existed"
+    }
+
+    # Create Storage Account
+    $subIdWithoutDashes = $SubscriptionId.ToLower().Replace("-", "");
+    $subIdFormated = "$($subIdWithoutDashes.SubString(0, 12))x$($subIdWithoutDashes.SubString(12, 4))x$($subIdWithoutDashes.SubString(16, 3))"
+    $saName = "csb$($subIdFormated)"
+    $storageAcc = Get-AzureRmStorageAccount -ResourceGroupName $csRgName -Name $saName -ErrorAction SilentlyContinue
+    if($storageAcc -eq $null)
+    {
+        Write-Host "Create Storage Account $($saName)"
+        $storageAcc = New-AzureRmStorageAccount -Location $Location -Name $saName -ResourceGroupName $csRgName -SkuName $CloudShellStorageSku -Tag @{"ms-resource-usage"="azure-cloud-shell"}
+    }
+    else
+    {
+       Write-Host "Storage Account $($saName) already existed"
+    }
+}
 
 for($i = 0; $i -lt $UserCount; $i++)
 {
@@ -97,11 +133,53 @@ for($i = 0; $i -lt $UserCount; $i++)
 
     if(!$hasAssignment)
     {
-        Write-Host "Create Role Assignment $($RoleDefinitionName) for $($displayName)"
+        Write-Host "Create Role Assignment $($RoleDefinitionName) for $($displayName) in Resource Group $($displayName)"
         New-AzureRmRoleAssignment -ObjectId $user.ObjectId -ResourceGroupName $displayName -RoleDefinitionName $RoleDefinitionName
     }
     else
     {
-        Write-Host "Role Assignment $($RoleDefinitionName) for $($displayName) already existed"
+        Write-Host "Role Assignment $($RoleDefinitionName) for $($displayName) in Resource Group $($displayName) already existed"
+    }
+
+    if($CreateCloudShellStorage)
+    {
+        # Give User Access to Storage Account
+        $assignments = Get-AzureRmRoleAssignment -ResourceGroupName $csRgName
+        $hasAssignment = $false;
+        for($j=0; $j -lt $assignments.Count;$j++)
+        {
+            if($assignments[$j].ObjectId -eq $user.ObjectId)
+            {
+                $hasAssignment = $true
+                break
+            }
+        }
+
+        if(!$hasAssignment)
+        {
+            Write-Host "Create Role Assignment $($RoleDefinitionName) for $($displayName) in Resource Group $($csRgName)"
+            New-AzureRmRoleAssignment -ObjectId $user.ObjectId -ResourceGroupName $csRgName -RoleDefinitionName $RoleDefinitionName
+        }
+        else
+        {
+            Write-Host "Role Assignment $($RoleDefinitionName) for $($displayName) in Resource Group $($csRgName) already existed"
+        }
+
+        $context = $storageAcc
+
+        $shareDisplayName = $userPrincipalName.ToLower().Replace("@", "-").Replace(".", "-")
+        $prefix = "cs-$($shareDisplayName)"
+        $shareId = (New-Guid).ToString("n").Substring(0, 16).ToLower()
+        $fullShareName = "$($prefix)-$($shareId)"
+        $share = Get-AzureStorageShare -Prefix $prefix -Context $storageAcc.Context
+        if($share -eq $null)
+        {
+            Write-Host "Create Storage Share $($fullShareName)"
+            New-AzureStorageShare -Name $fullShareName -Context $storageAcc.Context
+        }
+        else
+        {
+            Write-Host "Storage Share $($prefix) already existed"
+        }
     }
 }
